@@ -1,0 +1,217 @@
+import numpy as np
+import pandas as pd
+import streamlit as st
+from snowflake.snowpark.context import get_active_session
+
+session = get_active_session()
+
+st.set_page_config(page_title="🚕 NYC Yellow Taxi Analysis", layout="wide")
+st.title("🚕 NYC Yellow Taxi")
+st.caption("Using FCT_YELLOW_TRIPS + DIM tables.")
+
+DB = "NYC_TAXI"
+SC = "YELLOW_TAXI"
+FCT = f"{DB}.{SC}.FCT_YELLOW_TRIPS"
+DIM_Z = f"{DB}.{SC}.DIM_TBL_ZONES"
+DIM_V = f"{DB}.{SC}.DIM_TBL_VENDORS"
+DIM_P = f"{DB}.{SC}.DIM_TBL_PAYMENTS"
+DIM_R = f"{DB}.{SC}.DIM_TBL_RATES"
+
+@st.cache_data(ttl=300)
+def fetch_date_bounds():
+    q = f"""
+        SELECT MIN(DATE(PICKUP_TIME)) AS MIN_DATE,
+               MAX(DATE(PICKUP_TIME)) AS MAX_DATE
+        FROM {FCT}
+    """
+    df = session.sql(q).to_pandas()
+    if df.empty or pd.isna(df.MIN_DATE[0]) or pd.isna(df.MAX_DATE[0]):
+        return None, None
+    return pd.to_datetime(df.MIN_DATE[0]).date(), pd.to_datetime(df.MAX_DATE[0]).date()
+
+@st.cache_data(ttl=300)
+def fetch_distincts():
+    q = f"""
+        WITH BASE AS (
+            SELECT
+                z.BOROUGH,
+                z.ZONE,
+                v.VENDOR_DESCRIPTION,
+                p.PAYMENT_DESCRIPTION,
+                r.RATE_DESCRIPTION
+            FROM {FCT} t
+            LEFT JOIN {DIM_Z} z ON t.PICKUP_ZONE = z.LOCATIONID
+            LEFT JOIN {DIM_V} v ON t.VENDORID = v.VENDOR_CODE
+            LEFT JOIN {DIM_P} p ON t.PAYMENT_TYPE = p.PAYMENT_CODE
+            LEFT JOIN {DIM_R} r ON t.RATECODEID = r.RATE_CODE
+        )
+        SELECT
+            ARRAY_AGG(DISTINCT BOROUGH)             AS BOROUGHS,
+            ARRAY_AGG(DISTINCT ZONE)                AS ZONES,
+            ARRAY_AGG(DISTINCT VENDOR_DESCRIPTION)  AS VENDORS,
+            ARRAY_AGG(DISTINCT PAYMENT_DESCRIPTION) AS PAYMENTS,
+            ARRAY_AGG(DISTINCT RATE_DESCRIPTION)    AS RATES
+        FROM BASE
+    """
+    row = session.sql(q).to_pandas().iloc[0]
+
+    def arr(x):
+        return list(x) if isinstance(x, (list, tuple)) else ([] if x is None else [x])
+
+    return {
+        "boroughs": sorted([x for x in arr(row.BOROUGHS) if x]),
+        "zones":    sorted([x for x in arr(row.ZONES) if x]),
+        "vendors":  sorted([x for x in arr(row.VENDORS) if x]),
+        "payments": sorted([x for x in arr(row.PAYMENTS) if x]),
+        "rates":    sorted([x for x in arr(row.RATES) if x]),
+    }
+
+def build_where(start, end, hour_range, b, z, v, p, r):
+    clauses = [
+        f"DATE(t.PICKUP_TIME) BETWEEN '{start}' AND '{end}'",
+        f"HOUR(t.PICKUP_TIME) BETWEEN {hour_range[0]} AND {hour_range[1]}",
+    ]
+    if b:
+        clauses.append("z.BOROUGH IN (" + ",".join(f"'{x}'" for x in b) + ")")
+    if z:
+        clauses.append("z.ZONE IN (" + ",".join(f"'{x}'" for x in z) + ")")
+    if v:
+        clauses.append("v.VENDOR_DESCRIPTION IN (" + ",".join(f"'{x}'" for x in v) + ")")
+    if p:
+        clauses.append("p.PAYMENT_DESCRIPTION IN (" + ",".join(f"'{x}'" for x in p) + ")")
+    if r:
+        clauses.append("r.RATE_DESCRIPTION IN (" + ",".join(f"'{x}'" for x in r) + ")")
+    return "WHERE " + " AND ".join(clauses)
+
+@st.cache_data(ttl=300, show_spinner=True)
+def query_data(where_clause, limit_rows):
+    q = f"""
+        WITH BASE AS (
+            SELECT
+                CONCAT(t.VENDORID, '-', t.PICKUP_TIME) AS TRIP_ID,
+                DATE(t.PICKUP_TIME) AS PICKUP_DATE,
+                HOUR(t.PICKUP_TIME) AS PICKUP_HOUR,
+                t.PICKUP_TIME,
+                t.DROPOFF_TIME,
+                z.ZONE,
+                z.BOROUGH,
+                v.VENDOR_DESCRIPTION AS VENDOR_DESCRIPTION,
+                p.PAYMENT_DESCRIPTION,
+                r.RATE_DESCRIPTION,
+                t.FARE_AMOUNT,
+                t.TIP_AMOUNT,
+                t.TRIP_DISTANCE,
+                COALESCE(t.AIRPORT_FEE, 0) AS AIRPORT_FEE,
+                COALESCE(t.CONGESTION_SURCHARGE, 0) AS CONGESTION_SURCHARGE,
+                COALESCE(t.FARE_AMOUNT,0)
+                + COALESCE(t.EXTRA,0)
+                + COALESCE(t.MTA_TAX,0)
+                + COALESCE(t.TIP_AMOUNT,0)
+                + COALESCE(t.TOLLS_AMOUNT,0)
+                + COALESCE(t.IMPROVEMENT_SURCHARGE,0)
+                + COALESCE(t.CONGESTION_SURCHARGE,0)
+                + COALESCE(t.AIRPORT_FEE,0)
+                + COALESCE(t.CBD_CONGESTION_FEE,0)
+                AS TOTAL_CHARGES,
+                COALESCE(t.PASSENGER_COUNT,0) AS PASSENGER_COUNT
+            FROM {FCT} t
+            LEFT JOIN {DIM_Z} z ON t.PICKUP_ZONE = z.LOCATIONID
+            LEFT JOIN {DIM_V} v ON t.VENDORID = v.VENDOR_CODE
+            LEFT JOIN {DIM_P} p ON t.PAYMENT_TYPE = p.PAYMENT_CODE
+            LEFT JOIN {DIM_R} r ON t.RATECODEID = r.RATE_CODE
+            {where_clause}
+        )
+        SELECT * FROM BASE
+        LIMIT {limit_rows}
+    """
+    return session.sql(q).to_pandas()
+
+# ---------- Sidebar / Defaults ----------
+min_date, max_date = fetch_date_bounds()
+if not min_date:
+    st.error("No data found in fact table.")
+    st.stop()
+
+st.sidebar.header("Filters")
+
+# Reset button to clear selections
+if st.sidebar.button("Reset filters"):
+    for k in list(st.session_state.keys()):
+        if k.startswith("boroughs") or k.startswith("zones") or k.startswith("vendors") or k.startswith("payments") or k.startswith("rates"):
+            st.session_state.pop(k)
+
+# Full date range by default
+start = st.sidebar.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
+end   = st.sidebar.date_input("End Date",   value=max_date, min_value=min_date, max_value=max_date)
+hours = st.sidebar.select_slider("Hour Range", options=list(range(24)), value=(0, 23))
+
+d = fetch_distincts()
+sel_boroughs = st.sidebar.multiselect("Boroughs (optional)", d["boroughs"], key="boroughs")
+sel_zones    = st.sidebar.multiselect("Zones (optional)",    d["zones"],    key="zones")
+sel_vendors  = st.sidebar.multiselect("Vendors (optional)",  d["vendors"],  key="vendors")
+sel_payments = st.sidebar.multiselect("Payment Methods (optional)", d["payments"], key="payments")
+sel_rates    = st.sidebar.multiselect("Rate Codes (optional)", d["rates"], key="rates")
+
+limit = st.sidebar.number_input("Max Rows", min_value=1000, max_value=300000, value=100000, step=1000)
+
+# ---------- Query with graceful fallback ----------
+where = build_where(start, end, hours, sel_boroughs, sel_zones, sel_vendors, sel_payments, sel_rates)
+with st.spinner("Loading data..."):
+    df = query_data(where, int(limit))
+
+fallback_msg = None
+
+if df.empty:
+    # First: drop dimension filters, keep date & hour
+    where_loose = build_where(start, end, hours, [], [], [], [], [])
+    df = query_data(where_loose, int(limit))
+    if not df.empty:
+        fallback_msg = "No rows for the selected dimension filters. Showing data for the same date/hour range with **all boroughs/zones/vendors/payments/rates**."
+    else:
+        # Second: drop hour filter too (full day range)
+        where_widest = build_where(start, end, (0,23), [], [], [], [], [])
+        df = query_data(where_widest, int(limit))
+        if not df.empty:
+            fallback_msg = "No rows for that hour range. Showing data for the same **dates** across **all hours** and **all dimensions**."
+        else:
+            st.warning("Still no data. Try expanding the date range or remove filters.")
+            st.stop()
+
+if fallback_msg:
+    st.info(fallback_msg)
+
+# ---------- Types & derived ----------
+df["PICKUP_DATE"] = pd.to_datetime(df["PICKUP_DATE"])
+df["TIP_RATE"] = np.where(df["FARE_AMOUNT"] > 0, df["TIP_AMOUNT"] / df["FARE_AMOUNT"], np.nan)
+
+# ---------- KPIs ----------
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Trips", f"{len(df):,}")
+c2.metric("Passengers", f"{int(df.PASSENGER_COUNT.sum()):,}")
+c3.metric("Avg Fare", f"${df.FARE_AMOUNT.mean():,.2f}")
+c4.metric("Avg Tip", f"${df.TIP_AMOUNT.mean():,.2f}")
+c5.metric("Revenue", f"${df.TOTAL_CHARGES.sum():,.2f}")
+
+st.divider()
+
+# ---------- Trends ----------
+st.subheader("Trips & Revenue by Day")
+ts = df.groupby("PICKUP_DATE").agg(trips=("TRIP_ID","count"), revenue=("TOTAL_CHARGES","sum"))
+st.line_chart(ts)
+
+# ---------- Hourly ----------
+st.subheader("Hourly Patterns")
+hr = df.groupby("PICKUP_HOUR").agg(trips=("TRIP_ID","count"))
+st.bar_chart(hr)
+
+# ---------- Borough ----------
+st.subheader("Trips by Borough")
+br = df.groupby("BOROUGH").agg(trips=("TRIP_ID","count"))
+st.bar_chart(br)
+
+# ---------- Data Preview & Export ----------
+st.subheader("Export-Data")
+st.dataframe(df.head(200), use_container_width=True)
+
+csv = df.to_csv(index=False).encode()
+st.download_button("Download CSV", csv, "nyc_taxi_export.csv", "text/csv")
