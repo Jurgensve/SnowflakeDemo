@@ -1,5 +1,6 @@
-1. What were the total sales for the month of February 2025? Compare it to March 2025.
+1. What were the total sales for the month of February 2025? Compare it to March 2025?
 2. On average, what percentage of the total trip fare is charged for congestion?
 3. Is there any correlation between number of passengers to the time of day?
 4. What zone is the most common pick up zone? Give me the area name.
+
 5. Which vendor has the lowest amount of tips?
