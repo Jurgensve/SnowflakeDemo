@@ -33,7 +33,7 @@ SELECT
     END AS tip_percentage
 FROM (
     SELECT 
-        A.VENDORID,
+        VENDORID,
         TOTAL_AMOUNT AS fee_amount,
         TOTAL_AMOUNT AS total_amount_for_pct,
         'FARE' AS fee_type
@@ -42,7 +42,7 @@ FROM (
     UNION ALL
 
     SELECT
-        A.VENDORID,
+        VENDORID,
         TIP_AMOUNT AS fee_amount,
         TOTAL_AMOUNT AS total_amount_for_pct,
         'TIP' AS fee_type
@@ -51,5 +51,7 @@ FROM (
 LEFT JOIN DIM_TBL_VENDORS B
     ON t.VENDORID = B.VENDOR_CODE
 GROUP BY B.VENDOR_DESCRIPTION, fee_type;
+
+
 
 
